@@ -84,6 +84,14 @@ function fillXml(xml,d){
     const head=p.slice(0,p.indexOf('<w:r>')).replace('<w:pPr>','<w:pPr><w:tabs><w:tab w:val="left" w:pos="6480"/></w:tabs>');
     return head+runs.slice(0,5).join('')+run(d.name)+TAB+run('HN: ')+run(d.hn)+'</w:p>';
   });
+  // จัดตาราง: ความกว้างคอลัมน์, ระยะขอบเซลล์ และจัดข้อความกึ่งกลาง (ตามไฟล์ต้นแบบที่ปรับแล้ว)
+  xml=xml.replace(/<w:tbl>[\s\S]*<\/w:tbl>/,t=>t
+    .replace('<w:gridCol w:w="3808"/><w:gridCol w:w="2826"/>','<w:gridCol w:w="2720"/><w:gridCol w:w="3914"/>')
+    .replace(/<w:tcW w:w="3808"/g,'<w:tcW w:w="2720"').replace(/<w:tcW w:w="2826"/g,'<w:tcW w:w="3914"')
+    .replace(/<w:tblCellMar><w:left w:w="108" w:type="dxa"\/><w:right w:w="108" w:type="dxa"\/><\/w:tblCellMar>/g,
+      '<w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar>')
+    .replace(/<w:pPr><w:jc w:val="both"\/>/g,'<w:pPr><w:widowControl w:val="0"/><w:jc w:val="center"/>')
+    .replace(/<w:pPr><w:jc w:val="center"\/>/g,'<w:pPr><w:widowControl w:val="0"/><w:jc w:val="center"/>'));
   // เพิ่มแถวถ้ารายการเกินแบบฟอร์ม (10 แถว)
   const rowRe=/<w:tr[ >][\s\S]*?<\/w:tr>/g;
   const rows=xml.match(rowRe), need=d.rows.length-(rows.length-1);
