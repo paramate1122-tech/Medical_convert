@@ -59,7 +59,7 @@ td{padding:8px 8px 8px 0;border-top:1px solid var(--ln)}td.n{width:48px;color:va
   <div class="f"><label for="name">ชื่อ-นามสกุลผู้ป่วย</label><input id="name"></div>
   <div class="f"><label for="hn">HN</label><input id="hn"></div>
   <div class="tw"><table>
-    <thead><tr><th>ลำดับ</th><th>วันที่ตรวจ</th><th>รายการตรวจ</th><th>ส่วนที่ตรวจ</th><th></th></tr></thead>
+    <thead><tr><th>ลำดับ</th><th>วันที่ตรวจ</th><th>รายการตรวจ (Examination)</th><th></th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
   <div class="acts">
@@ -105,7 +105,7 @@ function fillXml(xml,d){
   return xml.replace(rowRe,tr=>{
     if(i++===0) return tr;
     const r=d.rows[i-2]; if(!r) return tr;
-    const vals=[String(i-1),r.date,r.exam,r.part]; let c=0;
+    const vals=[String(i-1),r.date,r.exam]; let c=0;
     return tr.replace(/<w:tc>[\s\S]*?<\/w:tc>/g,tc=>{
       const v=vals[c++], k=tc.lastIndexOf('</w:p>');
       const sz=(tc.match(/<w:sz w:val="(\d+)"/)||[])[1]||32;
@@ -140,19 +140,40 @@ function groups(line){
   return g.map(a=>a.map(w=>w.text).join(' ').trim());
 }
 // engLines: ผล OCR ภาษาอังกฤษ (HN, รายการตรวจ, ส่วนที่ตรวจ, วันที่)  thaLines: ผล OCR ภาษาไทย (ชื่อ)
-function parseTable(engLines,thaLines){
-  const rows=[],hns=[];
-  for(const l of engLines){
-    const g=groups(l); if(g.length<4) continue;
-    const dm=g[g.length-1].match(DATE);
-    hns.push((g[0].match(/\d{6,}/)||[''])[0]);
-    rows.push({date:dm?`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`:g[g.length-1],
-      exam:fixMod(g[g.length-3]),part:g[g.length-2]});
+function lineGroups(line, width){
+  const ws=(line.words||[]).filter(w=>w.text && w.text.trim()).sort((a,b)=>a.bbox.x0-b.bbox.x0);
+  if(!ws.length) return {cols:['','','',''], y:(line.bbox?.y0||0)};
+  const cols=['','','',''], bounds=[0.16,0.43,0.775];
+  for(const w of ws){
+    const x=((w.bbox.x0+w.bbox.x1)/2)/(width||1);
+    const idx=x<bounds[0]?0:x<bounds[1]?1:x<bounds[2]?2:3;
+    cols[idx]+=(cols[idx]?' ':'')+w.text.trim();
   }
-  const names=(thaLines||[]).map(l=>(l.text||'').split(/\s{3,}/).find(x=>/[\u0E00-\u0E7F]{2}/.test(x))||'').map(normThai);
-  return {hn:mode(hns),name:mode(names),rows};
+  return {cols,y:((line.bbox?.y0||0)+(line.bbox?.y1||line.bbox?.y0||0))/2};
 }
-
+function parseTable(engLines,thaLines,width){
+  const rows=[],hns=[],names=[];
+  const eng=engLines.map(l=>({...lineGroups(l,width),raw:l})).filter(x=>x.cols.some(Boolean));
+  const tha=(thaLines||[]).map(l=>({...lineGroups(l,width),raw:l})).filter(x=>x.cols.some(Boolean));
+  for(const e of eng){
+    const [hn,nameUnused,exam,date]=e.cols,dm=(date||'').match(DATE);
+    const hnClean=(hn.match(/\d{6,}/)||[''])[0];
+    if(!hnClean || !dm) continue;
+    hns.push(hnClean);
+    // English names are read from column 2 in the English OCR pass.
+    if(/^[A-Za-z][A-Za-z .,'-]{2,}$/.test((nameUnused||'').trim()) &&
+       !/^(name|patient|date|examination)$/i.test((nameUnused||'').trim())){
+      names.push((nameUnused||'').trim());
+    }
+    rows.push({y:e.y,date:`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`,exam:(exam||'').trim()});
+  }
+  for(const r of rows){
+    const candidate=tha.filter(t=>t.cols[1]&&Math.abs(t.y-r.y)<Math.max(35,width*0.03))
+      .sort((a,b)=>Math.abs(a.y-r.y)-Math.abs(b.y-r.y))[0];
+    if(candidate) names.push(normThai(candidate.cols[1]));
+  }
+  return {hn:mode(hns),name:mode(names),rows:rows.map(({y,...r})=>r)};
+}
 
 
 const $=id=>document.getElementById(id);
@@ -161,7 +182,7 @@ const num=()=>[...$('rows').children].forEach((tr,i)=>tr.querySelector('.n').tex
 
 function addRow(r={}){
   const tr=document.createElement('tr');
-  tr.innerHTML='<td class="n"></td>'+['date','exam','part'].map(k=>`<td><input data-k="${k}"></td>`).join('')+'<td><button class="x" title="ลบแถว">×</button></td>';
+  tr.innerHTML='<td class="n"></td>'+['date','exam'].map(k=>`<td><input data-k="${k}"></td>`).join('')+'<td><button class="x" title="ลบแถว">×</button></td>';
   tr.querySelectorAll('input').forEach(i=>i.value=r[i.dataset.k]||'');
   tr.querySelector('.x').onclick=()=>{tr.remove();num()};
   $('rows').appendChild(tr);num();
@@ -169,17 +190,21 @@ function addRow(r={}){
 
 // ขยายภาพ + แปลงเป็นขาว-ดำ (Otsu) ให้ OCR อ่านแม่นขึ้น
 function prep(bmp){
-  const s=Math.min(3,Math.max(1,3200/bmp.width)),c=document.createElement('canvas');
+  const s=Math.min(4,Math.max(1,3600/bmp.width)),c=document.createElement('canvas');
   c.width=Math.round(bmp.width*s);c.height=Math.round(bmp.height*s);
   const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(bmp,0,0,c.width,c.height);
-  const im=g.getImageData(0,0,c.width,c.height),d=im.data,h=new Array(256).fill(0),N=c.width*c.height;
-  for(let i=0;i<d.length;i+=4){const y=(d[i]*.299+d[i+1]*.587+d[i+2]*.114)|0;d[i]=y;h[y]++}
-  let sum=0,wB=0,sB=0,best=0,th=128;for(let t=0;t<256;t++)sum+=t*h[t];
-  for(let t=0;t<256;t++){wB+=h[t];if(!wB)continue;const wF=N-wB;if(!wF)break;sB+=t*h[t];
-    const v=wB*wF*(sB/wB-(sum-sB)/wF)**2;if(v>best){best=v;th=t}}
-  for(let i=0;i<d.length;i+=4){d[i]=d[i+1]=d[i+2]=d[i]>th?255:0;d[i+3]=255}
+  const im=g.getImageData(0,0,c.width,c.height),d=im.data;
+  // Normalize colored table-cell backgrounds, including dark-blue rows.
+  for(let i=0;i<d.length;i+=4){
+    const r=d[i],gg=d[i+1],b=d[i+2],mx=Math.max(r,gg,b),mn=Math.min(r,gg,b);
+    const sat=mx?((mx-mn)/mx):0, y=r*.299+gg*.587+b*.114;
+    const blueFill=sat>0.12 && b>r*1.08 && b>gg*1.02 && y<235;
+    const v=blueFill?255:y;
+    d[i]=d[i+1]=d[i+2]=v;d[i+3]=255;
+  }
   g.putImageData(im,0,0);return c;
 }
+
 
 async function ocr(lang,img,label,base){
   const w=await Tesseract.createWorker(lang,1,{logger:m=>{
@@ -197,7 +222,7 @@ async function handle(file){
     const img=prep(await createImageBitmap(file));
     const eng=await ocr('eng',img,'กำลังอ่านข้อมูลตาราง',5);
     const tha=await ocr('tha',img,'กำลังอ่านชื่อ',50);
-    const d=parseTable(eng,tha);
+    const d=parseTable(eng,tha,img.width);
     $('hn').value=d.hn;$('name').value=d.name;$('rows').innerHTML='';
     d.rows.forEach(addRow);if(!d.rows.length)addRow();
     $('res').style.display='block';st(d.rows.length?`อ่านได้ ${d.rows.length} รายการ`:'อ่านข้อมูลไม่ได้ ลองใช้ภาพที่ชัดขึ้น หรือกรอกเอง',100);
