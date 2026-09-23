@@ -122,34 +122,35 @@ async function buildDocx(JSZip,b64,d){
 }
 
 // ---------- อ่านตารางจากผล OCR (ใช้พิกัดคำ แบ่งคอลัมน์ตามช่องว่างกว้าง) ----------
-const MODS=['ct','mri','us','cxr','mam','ot'];
+// รูปแบบตารางที่อัพเดท: คอลัม1=HN, คอลัม2=ชื่อ-นามสกุล(ไทย/อังกฤษ), คอลัม3=รายการตรวจ (รวมส่วนที่ตรวจไว้ในช่องเดียว), คอลัม4=วันที่ตรวจ
+// หมายเหตุ: ตารางแบบเดิมมีคอลัมน์ "ส่วนที่ตรวจ" แยกออกมาต่างหาก แต่ในรูปแบบใหม่คอลัมน์นี้หายไป
+// (ถูกรวมเข้ากับ "รายการตรวจ" เป็นข้อความเดียว เช่น "LT. KNEE (AP, LATERAL)") จึงไม่ต้องแยก/ตรวจสอบรหัสการตรวจอีกต่อไป
 const DATE=/(\d{4})\s*[\/\-.]\s*(\d{2})\s*[\/\-.]\s*(\d{2})\s+(\d{2})\s*[:.]\s*(\d{2})\s*[:.]\s*(\d{2})/;
 const normThai=s=>s.replace(/\u0E4D\u0E32/g,'\u0E33').replace(/\s+/g,' ').trim();
 const mode=a=>{const m={};a.filter(Boolean).forEach(x=>m[x]=(m[x]||0)+1);return Object.keys(m).sort((p,q)=>m[q]-m[p])[0]||''};
-function lev(a,b){const d=[...Array(a.length+1)].map((_,i)=>[i]);for(let j=1;j<=b.length;j++)d[0][j]=j;
-  for(let i=1;i<=a.length;i++)for(let j=1;j<=b.length;j++)d[i][j]=Math.min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
-  return d[a.length][b.length]}
-function fixMod(t){
-  t=t.toLowerCase().replace(/[^a-z]/g,''); if(!t||MODS.includes(t)) return t;
-  const c=MODS.filter(m=>lev(m,t)<=1); return c.length===1?c[0]:t;
-}
 function groups(line){
   const ws=(line.words||[]).filter(w=>w.text.trim()).sort((a,b)=>a.bbox.x0-b.bbox.x0); if(!ws.length) return [];
   const hs=ws.map(w=>w.bbox.y1-w.bbox.y0).sort((a,b)=>a-b), th=hs[hs.length>>1]*2.5, g=[[ws[0]]];
   for(let i=1;i<ws.length;i++) (ws[i].bbox.x0-ws[i-1].bbox.x1>th?g.push([ws[i]]):g[g.length-1].push(ws[i]));
   return g.map(a=>a.map(w=>w.text).join(' ').trim());
 }
-// engLines: ผล OCR ภาษาอังกฤษ (HN, รายการตรวจ, ส่วนที่ตรวจ, วันที่)  thaLines: ผล OCR ภาษาไทย (ชื่อ)
+// engLines: ผล OCR ภาษาอังกฤษ (HN, [ชื่อ], รายการตรวจ, วันที่)  thaLines: ผล OCR ภาษาไทย (ชื่อ)
 function parseTable(engLines,thaLines){
-  const rows=[],hns=[];
+  const rows=[],hns=[],engNames=[];
   for(const l of engLines){
-    const g=groups(l); if(g.length<4) continue;
+    const g=groups(l); if(g.length<3) continue;
     const dm=g[g.length-1].match(DATE);
     hns.push((g[0].match(/\d{6,}/)||[''])[0]);
-    rows.push({date:dm?`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`:g[g.length-1],
-      exam:fixMod(g[g.length-3]),part:g[g.length-2]});
+    // คอลัมที่ 2 (ถ้ามี) อาจเป็นชื่อภาษาอังกฤษ เก็บไว้เป็นตัวเลือกสำรองกรณีไม่พบชื่อไทย
+    if(g.length>=4 && /[A-Za-z]{2}/.test(g[1]) && !/\d{4}/.test(g[1])) engNames.push(normThai(g[1]));
+    rows.push({
+      date: dm?`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`:g[g.length-1],
+      exam: normThai(g[g.length-2]||''),
+      part: '' // คอลัมน์นี้ไม่มีในรูปแบบใหม่ ปล่อยว่างให้กรอกเองถ้าจำเป็น
+    });
   }
-  const names=(thaLines||[]).map(l=>(l.text||'').split(/\s{3,}/).find(x=>/[\u0E00-\u0E7F]{2}/.test(x))||'').map(normThai);
+  const thaNames=(thaLines||[]).map(l=>(l.text||'').split(/\s{3,}/).find(x=>/[\u0E00-\u0E7F]{2}/.test(x))||'').map(normThai).filter(Boolean);
+  const names=thaNames.length?thaNames:engNames; // รองรับทั้งชื่อไทยและชื่ออังกฤษ
   return {hn:mode(hns),name:mode(names),rows};
 }
 
@@ -167,17 +168,35 @@ function addRow(r={}){
   $('rows').appendChild(tr);num();
 }
 
-// ขยายภาพ + แปลงเป็นขาว-ดำ (Otsu) ให้ OCR อ่านแม่นขึ้น
+// ขยายภาพ + แปลงเป็นขาว-ดำ (Otsu แบบแบ่งแถบ) ให้ OCR อ่านแม่นขึ้น
+// หมายเหตุ: เดิมใช้ Otsu แบบ threshold เดียวทั้งภาพ ทำให้แถว/คอลัมน์ที่มีพื้นสีเข้ม
+// (เช่น สีฟ้าเข้ม) ซึ่งมีค่า luminance ต่ำใกล้เคียงตัวอักษร ถูกรวมเป็นสีดำทั้งก้อน
+// จนอ่านตัวอักษรไม่ออก จึงเปลี่ยนมาคำนวณ threshold แยกเป็นแถบแนวนอน (local Otsu)
+// เพื่อให้แต่ละแถบปรับ threshold ตามความสว่างของพื้นหลังตัวเอง
 function prep(bmp){
   const s=Math.min(3,Math.max(1,3200/bmp.width)),c=document.createElement('canvas');
   c.width=Math.round(bmp.width*s);c.height=Math.round(bmp.height*s);
   const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(bmp,0,0,c.width,c.height);
-  const im=g.getImageData(0,0,c.width,c.height),d=im.data,h=new Array(256).fill(0),N=c.width*c.height;
-  for(let i=0;i<d.length;i+=4){const y=(d[i]*.299+d[i+1]*.587+d[i+2]*.114)|0;d[i]=y;h[y]++}
-  let sum=0,wB=0,sB=0,best=0,th=128;for(let t=0;t<256;t++)sum+=t*h[t];
-  for(let t=0;t<256;t++){wB+=h[t];if(!wB)continue;const wF=N-wB;if(!wF)break;sB+=t*h[t];
-    const v=wB*wF*(sB/wB-(sum-sB)/wF)**2;if(v>best){best=v;th=t}}
-  for(let i=0;i<d.length;i+=4){d[i]=d[i+1]=d[i+2]=d[i]>th?255:0;d[i+3]=255}
+  const im=g.getImageData(0,0,c.width,c.height),d=im.data,W=c.width,H=c.height;
+  const lum=new Uint8ClampedArray(W*H);
+  for(let i=0,p=0;i<d.length;i+=4,p++) lum[p]=(d[i]*.299+d[i+1]*.587+d[i+2]*.114)|0;
+  const otsu=h=>{
+    let sum=0,wB=0,sB=0,best=0,th=128,N=0;
+    for(let t=0;t<256;t++){sum+=t*h[t];N+=h[t]}
+    for(let t=0;t<256;t++){wB+=h[t];if(!wB)continue;const wF=N-wB;if(!wF)break;sB+=t*h[t];
+      const mB=sB/wB,mF=(sum-sB)/wF,v=wB*wF*(mB-mF)*(mB-mF);if(v>best){best=v;th=t}}
+    return th;
+  };
+  const band=Math.max(24,Math.round(H/40));
+  for(let y0=0;y0<H;y0+=band){
+    const y1=Math.min(H,y0+band),h=new Array(256).fill(0);
+    for(let y=y0;y<y1;y++)for(let x=0;x<W;x++)h[lum[y*W+x]]++;
+    const th=otsu(h);
+    for(let y=y0;y<y1;y++)for(let x=0;x<W;x++){
+      const p=y*W+x,i=p*4,v=lum[p]>th?255:0;
+      d[i]=d[i+1]=d[i+2]=v;d[i+3]=255;
+    }
+  }
   g.putImageData(im,0,0);return c;
 }
 
