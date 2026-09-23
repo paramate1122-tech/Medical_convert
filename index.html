@@ -128,41 +128,75 @@ async function buildDocx(JSZip,b64,d){
 const DATE=/(\d{4})\s*[\/\-.]\s*(\d{2})\s*[\/\-.]\s*(\d{2})\s+(\d{2})\s*[:.]\s*(\d{2})\s*[:.]\s*(\d{2})/;
 const normThai=s=>s.replace(/\u0E4D\u0E32/g,'\u0E33').replace(/\s+/g,' ').trim();
 const mode=a=>{const m={};a.filter(Boolean).forEach(x=>m[x]=(m[x]||0)+1);return Object.keys(m).sort((p,q)=>m[q]-m[p])[0]||''};
-// เลือกชื่อที่ "นิ่ง/ซ้ำกันมากที่สุด" ในบรรดาแคนดิเดตของภาษานั้นๆ พร้อมคะแนนความสม่ำเสมอ (0-1)
-// ใช้แทนการเดาว่าเป็นภาษาไทยหรืออังกฤษ เพราะ engine ที่ "ผิดภาษา" กับข้อความจริง มักสุ่มอ่านผิดไม่ซ้ำกันในแต่ละบรรทัด
-// ในขณะที่ engine ที่ "ถูกภาษา" จะอ่านชื่อผู้ป่วยคนเดิม (ซึ่งซ้ำกันทุกแถวในตาราง) ได้ตรงกันเกือบทุกครั้ง
-function bestName(cands){
-  const list=cands.filter(Boolean); if(!list.length) return {name:'',score:0};
-  const m={}; list.forEach(x=>m[x]=(m[x]||0)+1);
-  const top=Object.keys(m).sort((p,q)=>m[q]-m[p])[0];
-  return {name:top,score:m[top]/list.length};
+const med=a=>{const b=[...a].sort((p,q)=>p-q);return b.length?b[b.length>>1]:0};
+// แก้คำนำหน้าชื่อที่ OCR มักอ่านจุดเพี้ยน เช่น "นสี," "น,ส." → "น.ส."
+const TITLES=[[/^น\s*[.,]*\s*ส[ีิ]?\s*[.,]*\s*/,'น.ส. '],[/^ด\s*[.,]+\s*ช\s*[.,]*\s*/,'ด.ช. '],[/^ด\s*[.,]+\s*ญ\s*[.,]*\s*/,'ด.ญ. ']];
+function cleanThaiName(t){
+  t=normThai(t).replace(/[^฀-๿. ]/g,' ').replace(/\s+/g,' ').trim();
+  for(const [re,v] of TITLES) if(re.test(t)){t=t.replace(re,v);break}
+  // ตัดเศษอักษรท้ายชื่อที่ไม่ใช่คำ (เช่น ขอบเซลล์ที่ถูกอ่านเป็นตัวอักษร)
+  return t.split(' ').filter((w,i)=>i<3||w.length>1).join(' ').trim();
 }
-function groups(line){
-  const ws=(line.words||[]).filter(w=>w.text.trim()).sort((a,b)=>a.bbox.x0-b.bbox.x0); if(!ws.length) return [];
-  const hs=ws.map(w=>w.bbox.y1-w.bbox.y0).sort((a,b)=>a-b), th=hs[hs.length>>1]*2.5, g=[[ws[0]]];
-  for(let i=1;i<ws.length;i++) (ws[i].bbox.x0-ws[i-1].bbox.x1>th?g.push([ws[i]]):g[g.length-1].push(ws[i]));
-  return g.map(a=>a.map(w=>w.text).join(' ').trim());
-}
-// engLines: ผล OCR ภาษาอังกฤษ (HN, [ชื่อ], รายการตรวจ, วันที่)  thaLines: ผล OCR ภาษาไทย (ชื่อ)
-function parseTable(engLines,thaLines){
-  const rows=[],hns=[],engNames=[];
+// วิเคราะห์โครงตาราง จากผล OCR ภาษาอังกฤษ (ใช้พิกัดคำ)
+// - HN = คำแรกที่เป็นตัวเลข 6 หลักขึ้นไป, วันที่ = คำท้ายแถวที่ตรงรูปแบบวันเวลา
+// - คำที่อยู่ระหว่าง HN กับวันที่ แบ่งเป็น "ชื่อ" กับ "รายการตรวจ" ด้วยตำแหน่งขอบซ้ายของคอลัมน์รายการตรวจ
+//   ซึ่งหาจากช่องว่างที่กว้างที่สุดของทุกแถวรวมกัน (ไม่ตัดสินจากแถวเดียว เพราะรายการตรวจที่ยาว
+//   เช่น "LT. SHOULDER (AP, TRANSCAPULAR)" จะชิดวันที่มากจนช่องว่างแคบกว่าเกณฑ์ ทำให้คอลัมน์เลื่อนผิด)
+function layout(engLines){
+  const rows=[];
   for(const l of engLines){
-    const g=groups(l); if(g.length<3) continue;
-    const dm=g[g.length-1].match(DATE);
-    hns.push((g[0].match(/\d{6,}/)||[''])[0]);
-    // คอลัมที่ 2 (ถ้ามี) อาจเป็นชื่อภาษาอังกฤษ เก็บไว้เป็นตัวเลือกสำรองกรณีไม่พบชื่อไทย
-    if(g.length>=4 && /[A-Za-z]{2}/.test(g[1]) && !/\d{4}/.test(g[1])) engNames.push(normThai(g[1]));
-    rows.push({
-      date: dm?`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`:g[g.length-1],
-      exam: normThai(g[g.length-2]||''),
-      part: '' // คอลัมน์นี้ไม่มีในรูปแบบใหม่ ปล่อยว่างให้กรอกเองถ้าจำเป็น
-    });
+    const ws=(l.words||[]).filter(w=>w.text.trim()).sort((a,b)=>a.bbox.x0-b.bbox.x0);
+    if(!ws.length) continue;
+    let dI=ws.length,dm=null;
+    for(let i=ws.length-1;i>=0;i--){const m=ws.slice(i).map(w=>w.text).join(' ').match(DATE);if(m){dI=i;dm=m;break}}
+    const hI=ws.findIndex((w,i)=>i<dI&&/\d{6,}/.test(w.text));
+    if(!dm&&hI<0) continue; // ไม่ใช่แถวข้อมูล (เช่น หัวตาราง)
+    const h=med(ws.map(w=>w.bbox.y1-w.bbox.y0));
+    rows.push({ws,h,hn:hI<0?'':ws[hI].text.match(/\d{6,}/)[0],hnX1:hI<0?null:ws[hI].bbox.x1,
+      date:dm?`${dm[1]}/${dm[2]}/${dm[3]} ${dm[4]}:${dm[5]}:${dm[6]}`:'',
+      dateX0:dI<ws.length?ws[dI].bbox.x0:null,mid:ws.slice(hI+1,dI)});
   }
-  const thaNames=(thaLines||[]).map(l=>(l.text||'').split(/\s{3,}/).find(x=>/[\u0E00-\u0E7F]{2}/.test(x))||'').map(normThai).filter(Boolean);
-  // เทียบความสม่ำเสมอของผลชื่อไทย vs อังกฤษ แล้วเลือกฝั่งที่ "ซ้ำกันมากกว่า" (คือฝั่งที่อ่านถูกภาษาจริง)
-  const thaBest=bestName(thaNames), engBest=bestName(engNames);
-  const name = engBest.score>thaBest.score ? engBest.name : thaBest.name;
-  return {hn:mode(hns),name,rows};
+  const h=med(rows.map(r=>r.h))||20, splits=[];
+  for(const r of rows){
+    let best=0,x=null;
+    for(let i=1;i<r.mid.length;i++){const gp=r.mid[i].bbox.x0-r.mid[i-1].bbox.x1;if(gp>best){best=gp;x=r.mid[i].bbox.x0}}
+    if(best>h*2.5) splits.push(x);
+  }
+  // ถ้าไม่มีช่องว่างกว้างเลย ถือว่าไม่มีคอลัมน์ชื่อ คำตรงกลางทั้งหมดเป็นรายการตรวจ
+  const examX=splits.length?med(splits)-h:-Infinity;
+  let nx0=Infinity,nx1=-Infinity,ny0=Infinity,ny1=-Infinity;
+  for(const r of rows){
+    r.exam=normThai(r.mid.filter(w=>w.bbox.x0>=examX).map(w=>w.text).join(' '));
+    const nm=r.mid.filter(w=>w.bbox.x0<examX);
+    r.engName=normThai(nm.map(w=>w.text).join(' '));
+    const a=nm.length?Math.min(...nm.map(w=>w.bbox.x0)):r.hnX1, b=nm.length?Math.max(...nm.map(w=>w.bbox.x1)):examX;
+    if(a!=null&&isFinite(a)) nx0=Math.min(nx0,a);
+    if(b!=null&&isFinite(b)) nx1=Math.max(nx1,b);
+    ny0=Math.min(ny0,...r.ws.map(w=>w.bbox.y0));ny1=Math.max(ny1,...r.ws.map(w=>w.bbox.y1));
+  }
+  const nameBox=isFinite(nx0)&&isFinite(nx1)&&nx1>nx0?{x0:nx0-h,x1:nx1+h,y0:ny0-h,y1:ny1+h}:null;
+  return {rows,h,nameBox};
+}
+// ตัดเฉพาะคอลัมน์ชื่อจากภาพต้นฉบับ (ภาพเทาไม่แปลงขาว-ดำ) แล้วขยายให้ตัวอักษรใหญ่พอ สำหรับ OCR ภาษาไทย
+// การใช้ภาพขาว-ดำเต็มแถว ทำให้สระ/วรรณยุกต์และจุดในคำนำหน้า (น.ส.) เพี้ยนบ่อย
+function nameCrop(bmp,L,s){
+  const b=L.nameBox; if(!b) return null;
+  const x0=Math.max(0,b.x0/s),y0=Math.max(0,b.y0/s),x1=Math.min(bmp.width,b.x1/s),y1=Math.min(bmp.height,b.y1/s);
+  if(x1-x0<4||y1-y0<4) return null;
+  const k=Math.min(6,Math.max(2,55/(L.h/s))),c=document.createElement('canvas');
+  c.width=Math.round((x1-x0)*k);c.height=Math.round((y1-y0)*k);
+  const g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(bmp,x0,y0,x1-x0,y1-y0,0,0,c.width,c.height);
+  const im=g.getImageData(0,0,c.width,c.height),d=im.data;
+  for(let i=0;i<d.length;i+=4){d[i]=d[i+1]=d[i+2]=d[i]*.299+d[i+1]*.587+d[i+2]*.114;d[i+3]=255}
+  g.putImageData(im,0,0);return c;
+}
+// L: ผลจาก layout(), thaLines: ผล OCR ภาษาไทยของคอลัมน์ชื่อ
+function parseTable(L,thaLines){
+  const thaNames=(thaLines||[]).map(l=>cleanThaiName(l.text||'')).filter(t=>/[฀-๿]{2}/.test(t));
+  // ชื่อคนเดียวกันซ้ำทุกแถว ใช้ค่าที่อ่านได้บ่อยที่สุด; ใช้ชื่ออังกฤษเฉพาะเมื่ออ่านไทยไม่ได้และเป็นตัวอักษรล้วน
+  const engNames=L.rows.map(r=>r.engName).filter(t=>/^[A-Za-z][A-Za-z .,'-]*[A-Za-z.]$/.test(t)&&/[A-Za-z]{2}/.test(t));
+  const name=mode(thaNames)||mode(engNames);
+  return {hn:mode(L.rows.map(r=>r.hn)),name,rows:L.rows.map(r=>({date:r.date,exam:r.exam,part:''}))};
 }
 
 
@@ -212,7 +246,7 @@ function prep(bmp){
       d[i]=d[i+1]=d[i+2]=v;d[i+3]=255;
     }
   }
-  g.putImageData(im,0,0);return c;
+  g.putImageData(im,0,0);c.scale=s;return c;
 }
 
 async function ocr(lang,img,label,base){
@@ -228,10 +262,10 @@ async function handle(file){
   $('prev').src=URL.createObjectURL(file);$('prev').style.display='block';$('res').style.display='none';
   try{
     st('กำลังเตรียมภาพ…',2);
-    const img=prep(await createImageBitmap(file));
-    const eng=await ocr('eng',img,'กำลังอ่านข้อมูลตาราง',5);
-    const tha=await ocr('tha',img,'กำลังอ่านชื่อ',50);
-    const d=parseTable(eng,tha);
+    const bmp=await createImageBitmap(file),img=prep(bmp);
+    const L=layout(await ocr('eng',img,'กำลังอ่านข้อมูลตาราง',5));
+    const crop=nameCrop(bmp,L,img.scale);
+    const d=parseTable(L,crop?await ocr('tha',crop,'กำลังอ่านชื่อ',50):[]);
     $('hn').value=d.hn;$('name').value=d.name;$('rows').innerHTML='';
     d.rows.forEach(addRow);if(!d.rows.length)addRow();
     $('res').style.display='block';st(d.rows.length?`อ่านได้ ${d.rows.length} รายการ`:'อ่านข้อมูลไม่ได้ ลองใช้ภาพที่ชัดขึ้น หรือกรอกเอง',100);
